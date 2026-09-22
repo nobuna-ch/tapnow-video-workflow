@@ -1,0 +1,4 @@
+# Optional Word export support. The text workflow and environment checker use
+# only the Python standard library.
+python-docx>=1.2,<2
+Pillow>=12.3,<13
