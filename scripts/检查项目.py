@@ -15,7 +15,7 @@ from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
-from 工作路径 import (CURRENT_KINDS, infer_project_root, is_current_source,
+from 工作路径 import (CURRENT_KINDS, canonical_kind, infer_project_root, is_current_source,
                       is_history_source, is_relative_to, is_temporary_target)
 from 内容检查 import check_current_content, check_source_content
 
@@ -237,10 +237,10 @@ def check_project(root: Path, *, mode: str = "word") -> dict:
         problems.append("未找到可检查的当前 Markdown 源稿")
     grouped: dict[str, list[Path]] = {}
     for md in sources:
-        grouped.setdefault(md.name, []).append(md)
+        grouped.setdefault(canonical_kind(md.stem), []).append(md)
     for name, candidates in grouped.items():
         if len(candidates) > 1:
-            problems.append(f"{name}：当前 Markdown 只能保留一份")
+            problems.append(f"{name}：当前 Markdown 只能保留一份，同类新旧名称不能并存（{'、'.join(p.name for p in candidates)}）")
     for md in sources:
         if not CURRENT.fullmatch(md.name):
             problems.append(f"当前源稿名称不规范：{md.name}")

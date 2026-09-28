@@ -9,19 +9,21 @@ import hashlib
 import importlib.util
 import io
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
 import unittest
 from zipfile import ZIP_DEFLATED, ZipFile
+from unittest.mock import patch
 
 
 SKILL = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from 工作路径 import infer_project_root, plan_export
-from 内容检查 import (check_current_content, check_people_notes, check_script,
-                    check_storyboard, check_video)
+from 内容检查 import (check_assets, check_current_content, check_people_notes, check_script,
+                    check_source_content, check_storyboard, check_video)
 from 检查项目 import check_document_pair, check_project
 
 
@@ -134,6 +136,34 @@ STORYBOARD_COMPOSITE_VALID = """# 测试 分镜图提示词
 
 PNG_RED = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n0AAAAAASUVORK5CYII=")
 PNG_BLUE = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAusB9Y9Z45sAAAAASUVORK5CYII=")
+
+MODERN_VIDEO = """# 测试 视频提示词
+## 镜头01（抬头）
+模式：首帧
+输入素材：首帧=分镜01
+建议时长：2秒
+```text
+人物甲从坐定开始轻轻抬头，保持视线，镜头固定。
+音效：抬头时衣料轻响，安静室内底噪。
+对白：人物甲：“你好。”
+音色：成年女性，自然普通话，轻声平静。
+```
+"""
+
+MODERN_IMAGE = IMAGE_VALID.replace("分镜图提示词", "分镜").replace(
+    "卧室中景，人物甲坐在桌边。画面无字幕。", "```text\n卧室中景，人物甲坐在桌边。画面无字幕。\n```"
+)
+
+ASSETS_VALID = """# 测试 资产设定
+仅文字设定，图片待生成，音色未验证。
+## 人物：人物甲
+主体描述：成年女性，灰色上衣，短发。
+参考图片：人物甲.png（待生成）
+固定音色：成年女性，自然普通话。
+## 环境：卧室正面
+设定：窗在画面左侧，一张桌子。
+参考图片：待生成
+"""
 
 
 def load_exporter():
@@ -290,8 +320,142 @@ class ExecutionTests(unittest.TestCase):
 
         example = SKILL / "examples" / "最小示例" / "归档" / "文档源稿"
         self.assertEqual(check_script((example / "剧本.md").read_text(encoding="utf-8"))["问题"], [])
-        self.assertEqual(check_storyboard((example / "分镜图提示词.md").read_text(encoding="utf-8"))["问题"], [])
-        self.assertEqual(check_video((example / "视频提示词与台词.md").read_text(encoding="utf-8"))["问题"], [])
+        for name in ("资产设定.md", "分镜.md", "视频提示词.md"):
+            self.assertEqual(check_source_content(example / name, formal=True)["问题"], [], name)
+
+    def test_modern_video_frame_modes_and_single_copy_body(self):
+        self.assertEqual(check_video(MODERN_VIDEO)["问题"], [])
+        tail = MODERN_VIDEO.replace("模式：首帧", "模式：首尾帧").replace("首帧=分镜01", "首帧=分镜01；尾帧=分镜02")
+        self.assertEqual(check_video(tail)["问题"], [])
+        self.assertTrue(any("缺少尾帧" in p for p in check_video(tail.replace("；尾帧=分镜02", ""))["问题"]))
+        redundant = MODERN_VIDEO.replace("人物甲从坐定", "以@分镜01为首帧。人物甲从坐定")
+        self.assertTrue(any("不要机械写" in p for p in check_video(redundant)["问题"]))
+        split_audio = MODERN_VIDEO.replace("音效：抬头时衣料轻响，安静室内底噪。\n", "") + "音效：无\n"
+        self.assertTrue(any("同一提示词块" in p for p in check_video(split_audio)["问题"]))
+        two_blocks = MODERN_VIDEO + "```text\n第二块\n```\n"
+        self.assertTrue(any("只提供一个" in p for p in check_video(two_blocks)["问题"]))
+        unclosed = MODERN_VIDEO.rsplit("```", 1)[0]
+        self.assertTrue(any("闭合" in p for p in check_video(unclosed)["问题"]))
+        blank_speech = MODERN_VIDEO.replace("人物甲：“你好。”", "人物甲说一句话。")
+        self.assertTrue(any("实际句子" in p for p in check_video(blank_speech)["问题"]))
+        sound_last = MODERN_VIDEO.replace("音色：成年女性，自然普通话，轻声平静。", "镜头再次后退。")
+        self.assertTrue(any("正文末尾" in p for p in check_video(sound_last)["问题"]))
+
+    def test_modern_reference_checks_only_actual_input_materials(self):
+        reference = MODERN_VIDEO.replace("模式：首帧", "模式：全能参考").replace("首帧=分镜01", "分镜01、人物乙（音色参考）").replace(
+            "人物甲从坐定", "沿用 @分镜01 的构图和人物身份。人物甲从坐定")
+        # 可见人物甲未独立连接；输入人物乙也不要求机械引用全部清单。
+        self.assertEqual(check_video(reference)["问题"], [])
+        missing = reference.replace("@分镜01", "@人物甲")
+        self.assertTrue(any("@人物甲 不在输入素材清单" in p for p in check_video(missing)["问题"]))
+        substring = reference.replace("分镜01、人物乙", "分镜01、人物甲手机").replace("@分镜01", "@人物甲")
+        self.assertTrue(any("@人物甲 不在输入素材清单" in p for p in check_video(substring)["问题"]))
+        unclear_boundary = reference.replace("@分镜01 的构图和人物身份", "@分镜01保持构图和人物身份")
+        self.assertTrue(any("引用与正文边界不清" in p for p in check_video(unclear_boundary)["问题"]))
+        text_mode = MODERN_VIDEO.replace("模式：首帧", "模式：文本").replace("首帧=分镜01", "无").replace("## 镜头01", "## 节点01")
+        self.assertEqual(check_video(text_mode)["问题"], [])
+
+    def test_multiline_dialogue_and_bold_metadata_in_legacy_name(self):
+        multiline = MODERN_VIDEO.replace("对白：人物甲：“你好。”", "对白：\n妈妈（温和）：“你好。”\n（儿子先倾听，再开口。）\n儿子：“我回来了。”")
+        self.assertEqual(check_video(multiline)["问题"], [])
+        mixed = multiline.replace("对白：\n妈妈（温和）：“你好。”", "对白：妈妈（温和）：“你好。”")
+        self.assertEqual(check_video(mixed)["问题"], [])
+        blank = multiline.replace("儿子：“我回来了。”", "儿子：")
+        self.assertTrue(any("实际句子" in p for p in check_video(blank)["问题"]))
+        action = multiline.replace("儿子：“我回来了。”", "镜头：随后后退到门外。")
+        self.assertTrue(any("正文末尾" in p for p in check_video(action)["问题"]))
+        silent_with_extra_dialogue = multiline.replace("妈妈（温和）：“你好。”", "无")
+        self.assertTrue(any("实际句子" in p for p in check_video(silent_with_extra_dialogue)["问题"]))
+        unnamed = multiline.replace("儿子：“我回来了。”", "“我回来了。”")
+        self.assertTrue(any("实际句子" in p for p in check_video(unnamed)["问题"]))
+        root = self.project()
+        legacy = root / "归档" / "文档源稿" / "视频提示词与台词.md"
+        bold = multiline.replace("模式：", "**模式**：").replace("输入素材：", "**输入素材**：").replace("建议时长：", "**建议时长**：")
+        legacy.write_text(bold, encoding="utf-8")
+        self.assertEqual(check_source_content(legacy, formal=True)["问题"], [])
+        colon_inside_bold = bold.replace("**：", "：**")
+        legacy.write_text(colon_inside_bold, encoding="utf-8")
+        self.assertEqual(check_source_content(legacy, formal=True)["问题"], [])
+
+    def test_modern_storyboard_keeps_execution_fields(self):
+        self.assertEqual(check_storyboard(MODERN_IMAGE, modern=True)["问题"], [])
+        no_location = MODERN_IMAGE.replace("地点：卧室。\n", "")
+        self.assertTrue(any("缺少地点" in p for p in check_storyboard(no_location, modern=True)["问题"]))
+        empty = MODERN_IMAGE.replace("卧室中景，人物甲坐在桌边。画面无字幕。", "")
+        self.assertTrue(any("非空且闭合" in p for p in check_storyboard(empty, modern=True)["问题"]))
+        multiple = MODERN_IMAGE.replace("主要环境锚点：卧室_E01。", "主要环境锚点：卧室正面、卧室窗侧。")
+        self.assertTrue(any("只能使用一个" in p for p in check_storyboard(multiple, modern=True)["问题"]))
+
+    def test_legacy_fenced_video_and_static_history_are_not_migrated(self):
+        fenced = TEMPLATE_DIALOGUE_VALID.replace("以@分镜_01为首帧。人物甲说：“你好。”", "```text\n以@分镜_01为首帧。人物甲说：“你好。”\n```")
+        self.assertEqual(check_video(fenced)["问题"], [])
+        root = self.project()
+        source = root / "归档" / "文档源稿"
+        (source / "剧本.md").write_text(SCRIPT_VALID, encoding="utf-8")
+        history = root / "归档" / "历史版本"
+        history.mkdir()
+        legacy = history / "视频提示词与台词_第01版.md"
+        original = "# 静态历史\n\n旧有结构，不套新字段。\n".encode("utf-8")
+        legacy.write_bytes(original)
+        self.assertEqual(check_project(root, mode="text")["问题"], [])
+        self.assertEqual(legacy.read_bytes(), original)
+
+    def test_asset_summary_replaces_per_person_notes(self):
+        root = self.project()
+        people = root / "制作素材" / "人物"
+        people.mkdir(parents=True)
+        (people / "人物甲.png").write_bytes(PNG_RED)
+        (root / "归档" / "文档源稿" / "资产设定.md").write_text(ASSETS_VALID, encoding="utf-8")
+        self.assertEqual(check_assets(ASSETS_VALID)["问题"], [])
+        self.assertEqual(check_people_notes(root)[0], [])
+        (people / "人物乙.png").write_bytes(PNG_RED)
+        self.assertTrue(any("人物乙" in p for p in check_people_notes(root)[0]))
+        self.assertTrue(any("缺少固定音色" in p for p in check_assets(ASSETS_VALID.replace("固定音色：成年女性，自然普通话。", ""))["问题"]))
+
+    def test_new_names_require_new_structure_and_aliases_are_unique(self):
+        root = self.project()
+        source = root / "归档" / "文档源稿"
+        video = source / "视频提示词.md"
+        video.write_text(VIDEO_VALID, encoding="utf-8")
+        self.assertTrue(any("模式须为" in p for p in check_source_content(video, formal=True)["问题"]))
+        video.write_text(MODERN_VIDEO, encoding="utf-8")
+        legacy = source / "视频提示词与台词.md"
+        legacy.write_text(MODERN_VIDEO.replace("# 测试 视频提示词", "# 测试 视频提示词与台词"), encoding="utf-8")
+        self.assertEqual(check_source_content(legacy, formal=True)["问题"], [])
+        self.assertTrue(any("同类新旧名称不能并存" in p for p in check_project(root, mode="text")["问题"]))
+        with self.assertRaisesRegex(ValueError, "新旧名称不能同时导出"):
+            plan_export(video, project=root)
+
+    def test_modern_four_documents_export_and_text_mode_no_dependencies(self):
+        root = self.project()
+        source = root / "归档" / "文档源稿"
+        documents = {"剧本": SCRIPT_VALID, "资产设定": ASSETS_VALID, "分镜": MODERN_IMAGE, "视频提示词": MODERN_VIDEO}
+        exporter = load_exporter()
+        for name, value in documents.items():
+            md = source / f"{name}.md"
+            md.write_text(value, encoding="utf-8")
+            self.assertEqual(plan_export(md, project=root).output, (root / f"{name}.docx").resolve())
+            stderr = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                self.assertEqual(exporter.main([str(md), "--项目目录", str(root)]), 0, stderr.getvalue())
+        self.assertEqual(check_project(root, mode="word")["问题"], [])
+        run = subprocess.run([sys.executable, "-S", "-B", "-X", "utf8", str(SCRIPTS / "检查项目.py"), str(root), "--模式", "text"],
+                             cwd=self.case, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_atomic_replace_permission_failure_keeps_existing_word(self):
+        root = self.project()
+        md = root / "归档" / "文档源稿" / "视频提示词.md"
+        md.write_text(MODERN_VIDEO, encoding="utf-8")
+        old = root / "视频提示词.docx"
+        old.write_bytes(b"KEEP-EXISTING-WORD")
+        exporter = load_exporter()
+        with patch.object(exporter.os, "replace", side_effect=PermissionError("模拟文件占用")):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code = exporter.main([str(md), "--项目目录", str(root), "--更新"])
+        self.assertEqual(code, 1)
+        self.assertEqual(old.read_bytes(), b"KEEP-EXISTING-WORD")
+        self.assertEqual(list(root.glob(".视频提示词.*.docx")), [])
 
     def test_orphan_word_and_valueerror_are_reported(self):
         root = self.project()
@@ -426,6 +590,7 @@ def main() -> int:
     args, unittest_args = parser.parse_known_args()
     work = args.工作目录.expanduser().resolve()
     work.mkdir(parents=True, exist_ok=True)
+    os.environ["TEMP"] = os.environ["TMP"] = str(work)
     ExecutionTests.work = work
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ExecutionTests)
     result = unittest.TextTestRunner(verbosity=2).run(suite)

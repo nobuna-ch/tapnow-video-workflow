@@ -697,7 +697,7 @@ def save_to_temporary(document: Document, output_path: Path, *, update: bool) ->
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="将剧本、分镜图提示词、视频提示词与台词或简短说明书导出为同名 Word。",
+        description="将剧本、资产设定、分镜、视频提示词导出为同名 Word；兼容既有旧名称与简短说明书。",
     )
     parser.add_argument("markdown", type=Path, help="分类文档 Markdown 源稿路径")
     parser.add_argument(

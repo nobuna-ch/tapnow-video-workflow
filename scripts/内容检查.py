@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 
 
-SHOT = re.compile(r"^##\s+镜头\s*([0-9]+[A-Za-z]?)\b([^\n]*)", re.M | re.I)
+SHOT = re.compile(r"^##\s+(?:镜头|节点)\s*([0-9]+[A-Za-z]?)(?=\s|$|[（(:：—–-])([^\n]*)", re.M | re.I)
 TIME = re.compile(r"全片\s*约?\s*([0-9]+(?:\.\d+)?)\s*[—–-]\s*约?\s*([0-9]+(?:\.\d+)?)\s*秒")
 DURATION = re.compile(r"(?:成片时长|新增时长|原片时长)\s*[:：]?\s*约?\s*([0-9]+(?:\.\d+)?)\s*秒")
 FIELD_START = re.compile(
@@ -79,7 +79,7 @@ def _section_bodies(text: str, label: str) -> list[str]:
         collected: list[str] = []
         for raw in text[match.end():].splitlines():
             line = raw.strip()
-            if not line or re.fullmatch(r"`{3,}|~{3,}", line):
+            if not line or re.fullmatch(r"(?:`{3,}|~{3,})(?:text)?", line, re.I):
                 continue
             if line.startswith("#") or FIELD_START.match(line) or re.match(r"^\*\*[^*]+\*\*$", line):
                 break
@@ -138,12 +138,12 @@ def check_timeline(items: list[Shot], label: str) -> tuple[list[str], list[str]]
     return problems, manual
 
 
-def check_storyboard(text: str) -> dict:
+def check_storyboard(text: str, *, modern: bool = False) -> dict:
     problems: list[str] = []
     manual: list[str] = []
     items = shots(text)
     if not items:
-        return {"问题": ["分镜图提示词：未识别到镜头标题"], "待人工": [] , "镜头": []}
+        return {"问题": ["分镜：未识别到镜头标题"], "待人工": [] , "镜头": []}
     seen: set[str] = set()
     for item in items:
         prefix = f"分镜镜头{item.number}"
@@ -152,6 +152,11 @@ def check_storyboard(text: str) -> dict:
         seen.add(item.number)
         if item.start is None:
             problems.append(f"{prefix}：缺少全片时间区间")
+        if modern:
+            if not DURATION.search(item.body):
+                problems.append(f"{prefix}：缺少成片时长")
+            if not _field_value(item.body, r"地点"):
+                problems.append(f"{prefix}：缺少地点")
         _check_declared_duration(item, prefix, problems)
         composite = _has(item.body, r"分屏|两侧|左右.{0,20}合成")
         exceptional = composite or _has(item.body, r"(?:复用|沿用|合成|现成|末帧|尾片|独立空镜).{0,30}(?:来源|素材|画面|视频|片段|镜头)|(?:来源|素材).{0,30}(?:复用|合成|现成|末帧|尾片)")
@@ -161,6 +166,8 @@ def check_storyboard(text: str) -> dict:
             problems.append(f"{prefix}：缺少主要环境锚点或明确的复用/合成来源")
         elif len(anchor_ids) > 1:
             problems.append(f"{prefix}：普通镜头的主要环境锚点包含多个 E 编号")
+        elif modern and not exceptional and len([part for part in re.split(r"[、，,；;|]", anchor_value) if part.strip()]) > 1:
+            problems.append(f"{prefix}：普通镜头只能使用一个主要环境锚点")
         if composite and not anchor_value:
             sides = list(re.finditer(r"^###\s*(左半屏|右半屏|左侧|右侧)[^\n]*$", item.body, re.M))
             for index, side in enumerate(sides):
@@ -170,6 +177,10 @@ def check_storyboard(text: str) -> dict:
                     problems.append(f"{prefix}：{side.group(1)}应明确且只使用一个 E 编号环境锚点")
         if not _section_has_body(item.body, r"分镜图\s*prompt") and not _has(item.body, r"(?:无需(?:新)?(?:分镜图)?生成|无需新分镜图|现成尾片|复用现成)"):
             problems.append(f"{prefix}：缺少分镜图 prompt")
+        if modern and not exceptional:
+            blocks, _, unclosed = _copy_blocks(item.body)
+            if unclosed or len(blocks) != 1 or not blocks[0][1] or blocks[0][0] != "text":
+                problems.append(f"{prefix}：普通分镜须提供一个非空且闭合的 text 提示词块")
         if not _field_value(item.body, r"连接素材") and not exceptional:
             problems.append(f"{prefix}：缺少连接素材或明确来源")
         if not _field_value(item.body, r"起始状态"):
@@ -209,7 +220,7 @@ def _plain_compare(text: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u3400-\u9fff]", "", text).lower()
 
 
-def check_video(text: str) -> dict:
+def check_legacy_video(text: str) -> dict:
     problems: list[str] = []
     manual: list[str] = []
     items = shots(text)
@@ -301,6 +312,161 @@ def check_video(text: str) -> dict:
     return {"问题": list(dict.fromkeys(problems)), "待人工": list(dict.fromkeys(manual)), "镜头": items}
 
 
+def _line_field(text: str, label: str) -> str:
+    """新文档字段独占一行；保留输入素材的分号和完整对白。"""
+    match = re.search(r"^[ \t]*(?:\*\*)?" + label + r"(?:\*\*)?[ \t]*[:：][ \t]*(?:\*\*)?([^\r\n]*)", text, re.M | re.I)
+    return _clean_value(match.group(1)) if match else ""
+
+
+def _copy_blocks(text: str) -> tuple[list[tuple[str, str]], str, bool]:
+    """提取完整 fenced 块及块外字段，不把未闭合代码块误判成可交付正文。"""
+    blocks: list[tuple[str, str]] = []
+    outside: list[str] = []
+    content: list[str] = []
+    marker = ""
+    language = ""
+    for line in text.splitlines():
+        fence = re.fullmatch(r"[ \t]*(`{3,}|~{3,})[ \t]*(\w*)[ \t]*", line)
+        if not marker:
+            if fence:
+                marker, language = fence.group(1), fence.group(2).lower()
+                content = []
+            else:
+                outside.append(line)
+        elif fence and not fence.group(2) and fence.group(1)[0] == marker[0] and len(fence.group(1)) >= len(marker):
+            blocks.append((language, "\n".join(content).strip()))
+            marker = ""
+        else:
+            content.append(line)
+    return blocks, "\n".join(outside), bool(marker)
+
+
+def _input_names(value: str) -> set[str]:
+    names: set[str] = set()
+    for raw in re.split(r"[；;、，,|]", value):
+        value = re.split(r"[=＝]", raw, maxsplit=1)[-1].strip()
+        value = re.split(r"[（(]", value, maxsplit=1)[0].strip(" `。@")
+        if value and value != "无":
+            names.add(value)
+    return names
+
+
+def _check_dialogue_tail(lines: list[str], prefix: str) -> list[str]:
+    """对白可在冒号后，或在后续行逐个角色给出；保留同块音色及括号表演说明。"""
+    problems: list[str] = []
+    spoken: list[str] = []
+    direction = re.compile(r"^(?:(?:固定)?音色|声音表演|表演|口型|发言时机)\s*[:：]")
+    for line in lines:
+        if not line:
+            continue
+        if direction.match(line) or re.fullmatch(r"[（(][^\n]+[）)][。.]?", line):
+            continue
+        spoken.append(line)
+    if not spoken:
+        return [f"{prefix}：提示词块末尾缺少对白，静默请写对白：无"]
+    if len(spoken) == 1 and re.fullmatch(r"无[。.]?", spoken[0]):
+        return []
+    for line in spoken:
+        # 同行多角色可以用分号分隔；台词内的普通标点无需拆为新管理字段。
+        for segment in re.split(r"[；;](?=[^；;：:]{1,30}[:：])", line):
+            match = re.fullmatch(r"([^：:]{1,40})[：:][ \t]*(.+)", segment.strip())
+            if not match:
+                problems.append(f"{prefix}：对白须写角色及实际句子，不能仅写说一句话；正文末尾不再追加动作描述")
+                continue
+            speaker, utterance = match.groups()
+            if re.match(r"^(?:镜头|运镜|动作|衔接|起始状态|模式|输入素材|音效|对白)$", speaker.strip()):
+                problems.append(f"{prefix}：正文末尾不再追加动作或平台设置，应只保留音效、对白及必要声音表演")
+            if (not _plain_compare(utterance) or re.search(r"待填|待补|\.\.\.|…|说一句(?:话)?[。.]?$", utterance)
+                    or re.fullmatch(r"[“\"「『]?\s*[”\"」』]?", utterance)):
+                problems.append(f"{prefix}：对白须写角色及实际句子，不能仅写说一句话")
+    return problems
+
+
+def check_video(text: str, *, modern: bool | None = None) -> dict:
+    """新旧结构按内容分流；新名称由调用方要求新结构。"""
+    if modern is None:
+        modern = bool(re.search(r"^[ \t]*(?:\*\*)?(?:模式|输入素材|建议时长)(?:\*\*)?[ \t]*[:：]", text, re.M | re.I))
+    if not modern:
+        result = check_legacy_video(text)
+        result["待人工"].append("此文档沿用旧视频结构；兼容读取不要求迁移历史，新建文档采用模式、输入素材、建议时长及一块完整提示词")
+        return result
+    problems: list[str] = []
+    manual: list[str] = []
+    items = shots(text)
+    if not items:
+        return {"问题": ["视频提示词：未识别到镜头或节点标题"], "待人工": [], "镜头": []}
+    seen: set[str] = set()
+    for item in items:
+        prefix = f"视频镜头{item.number}"
+        if item.number in seen:
+            problems.append(f"{prefix}：镜号重复")
+        seen.add(item.number)
+        blocks, outside, unclosed = _copy_blocks(item.body)
+        if unclosed or len(blocks) != 1 or (blocks and blocks[0][0] != "text"):
+            problems.append(f"{prefix}：必须提供且只提供一个闭合的 text 提示词块")
+        prompt = blocks[0][1] if len(blocks) == 1 else ""
+        mode = _line_field(outside, "模式").rstrip("。")
+        material = _line_field(outside, "输入素材")
+        duration = _line_field(outside, "建议时长")
+        if mode not in {"首帧", "首尾帧", "全能参考", "文本"}:
+            problems.append(f"{prefix}：模式须为首帧/首尾帧/全能参考/文本")
+        if not material:
+            problems.append(f"{prefix}：缺少输入素材，文本模式请写无")
+        if not re.fullmatch(r"约?\s*(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)\s*秒[。.]?", duration):
+            problems.append(f"{prefix}：建议时长须为大于零的秒数")
+        for label in ("首帧", "尾帧") if mode == "首尾帧" else ("首帧",) if mode == "首帧" else ():
+            match = re.search(r"(?:^|[；;、，,])[ \t]*" + label + r"\s*[=＝]\s*([^；;、，,]+)", material)
+            if not match or _clean_value(match.group(1)).rstrip("。") in {"", "无", "待填"}:
+                problems.append(f"{prefix}：{mode}模式缺少{label}=素材名设置")
+        names = _input_names(material)
+        refs = set(re.findall(r"@([0-9A-Za-z_\u3400-\u9fff-]+)", prompt))
+        if mode == "全能参考":
+            if not names:
+                problems.append(f"{prefix}：全能参考模式须列出实际输入素材")
+            if not refs:
+                problems.append(f"{prefix}：全能参考正文缺少实际素材的 @ 引用及用途")
+        for ref in sorted(refs):
+            if ref not in names:
+                known_prefix = next((name for name in sorted(names, key=len, reverse=True) if ref.startswith(name)), None)
+                if known_prefix:
+                    problems.append(f"{prefix}：@引用与正文边界不清（@{ref}）；请在素材名 @{known_prefix} 后加空格或标点，或核对完整素材名称")
+                else:
+                    problems.append(f"{prefix}：正文引用 @{ref} 不在输入素材清单中")
+        if mode in {"首帧", "首尾帧"} and re.search(r"以\s*@\s*分镜[^\n。；;]{0,40}(?:为|作为)\s*首帧", prompt):
+            problems.append(f"{prefix}：首帧应在模式/输入素材中设置，正文不要机械写以@分镜为首帧")
+        if mode == "文本" and (names or refs):
+            problems.append(f"{prefix}：文本模式输入素材应为无，正文不能引用未连接素材")
+        if re.search(r"^[ \t]*(?:\*\*)?(?:模式|输入素材|建议时长)(?:\*\*)?\s*[:：]", prompt, re.M):
+            problems.append(f"{prefix}：平台设置须放在提示词块外")
+        if re.search(r"^[ \t]*(?:\*\*)?(?:纯台词|台词文本|固定音色|音色|发言时机|音效(?:\s*prompt)?|对白)(?:\*\*)?\s*[:：]", outside, re.M | re.I):
+            problems.append(f"{prefix}：音效、对白和必要音色须放在同一提示词块内")
+        sound = _line_field(prompt, "音效")
+        if not sound:
+            problems.append(f"{prefix}：提示词块末尾缺少音效，无需求请写音效：无")
+        lines = [line.strip() for line in prompt.splitlines() if line.strip()]
+        audio_index = next((i for i, line in enumerate(lines) if re.match(r"音效\s*[:：]", line)), None)
+        dialogue_index = next((i for i, line in enumerate(lines) if re.match(r"对白\s*[:：]", line)), None)
+        if dialogue_index is None:
+            problems.append(f"{prefix}：提示词块末尾缺少对白，静默请写对白：无")
+        else:
+            dialogue_lines = [re.sub(r"^对白\s*[:：]\s*", "", lines[dialogue_index]), *lines[dialogue_index + 1:]]
+            problems.extend(_check_dialogue_tail(dialogue_lines, prefix))
+        if audio_index is not None and dialogue_index is not None:
+            if audio_index == 0:
+                problems.append(f"{prefix}：提示词缺少动作/画面正文")
+            if dialogue_index <= audio_index or any(not re.match(r"(?:(?:固定)?音色|表演|声音表演|口型|发言时机)\s*[:：]", line)
+                                                    and not re.fullmatch(r"[（(][^\n]+[）)][。.]?", line)
+                                                    for line in lines[audio_index + 1:dialogue_index]):
+                problems.append(f"{prefix}：正文末尾应连续给出音效、对白及必要音色/表演")
+        if _has(prompt, r"(?:音色|表演)\s*[:：]\s*(?:同上|见上|见资产|另见)"):
+            problems.append(f"{prefix}：必要音色/表演须在同块完整提供，不能要求跨文档拼接")
+        _check_declared_duration(item, prefix, problems)
+    p, m = check_timeline(items, "视频")
+    problems.extend(p); manual.extend(m)
+    manual.append("仅核对模式、素材清单和完整提示词；素材是否选中、引用用途、画面/动作连续性、对白表演及生成音效仍需实际检查")
+    return {"问题": list(dict.fromkeys(problems)), "待人工": list(dict.fromkeys(manual)), "镜头": items}
+
+
 def check_script(text: str) -> dict:
     """检查剧本的最小制作字段；兼容旧稿将字段写在开头自然段。"""
     problems: list[str] = []
@@ -343,22 +509,65 @@ def check_script(text: str) -> dict:
     return {"问题": list(dict.fromkeys(problems)), "待人工": manual}
 
 
+def _current_path(root: Path, names: tuple[str, ...]) -> Path | None:
+    return next((folder / f"{name}.md" for name in names
+                 for folder in (root / "归档" / "文档源稿", root)
+                 if (folder / f"{name}.md").is_file()), None)
+
+
+def _asset_sections(text: str) -> list[tuple[str, str, str]]:
+    headings = list(re.finditer(r"^##[ \t]+(人物|道具|产品|环境|场景)[ \t]*[:：][ \t]*([^\r\n]+)", text, re.M))
+    return [(match.group(1), match.group(2).strip(), text[match.end():headings[index + 1].start() if index + 1 < len(headings) else len(text)])
+            for index, match in enumerate(headings)]
+
+
+def check_assets(text: str) -> dict:
+    problems: list[str] = []
+    sections = _asset_sections(text)
+    if not sections and not _has(text, r"(?:本片|本项目).{0,12}(?:无需|无).{0,12}(?:资产|人物|道具|环境)"):
+        problems.append("资产设定：未识别到人物/道具/产品/环境/场景小节")
+    seen: set[str] = set()
+    for kind, name, body in sections:
+        prefix = f"资产设定 {kind}：{name}"
+        if name in seen:
+            problems.append(f"{prefix}：资产名称重复")
+        seen.add(name)
+        if not (_line_field(body, "主体描述") or _line_field(body, "设定")):
+            problems.append(f"{prefix}：缺少主体描述/设定")
+        if not _line_field(body, "参考图片"):
+            problems.append(f"{prefix}：缺少参考图片，尚无图片请写待生成")
+        if kind == "人物":
+            voice = _line_field(body, "固定音色")
+            if not voice:
+                problems.append(f"{prefix}：缺少固定音色，无对白请写无")
+            elif re.match(r"^(?:同上|另见|见上)", voice):
+                problems.append(f"{prefix}：固定音色须完整填写")
+    return {"问题": problems, "待人工": ["资产设定只核对文字字段；未生成或未实际查看的图片、音色不能视为视觉/声音通过"]}
+
+
 def check_people_notes(root: Path) -> tuple[list[str], list[str]]:
     problems: list[str] = []
     manual: list[str] = []
     folder = root / "制作素材" / "人物"
     if not folder.is_dir():
         return problems, manual
+    summary = _current_path(root, ("资产设定",))
+    summary_people = [(name, body) for kind, name, body in _asset_sections(read_utf8(summary)) if kind == "人物"] if summary else []
     for image in folder.rglob("*"):
         if not image.is_file() or image.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
             continue
+        if summary:
+            # 汇总说明覆盖每张已存在人物图；三视图/侧面等图片无需逐张新建说明。
+            covered = any(image.name in body or image.stem == name for name, body in summary_people)
+            if covered:
+                continue
         notes = [image.with_suffix(ext) for ext in (".txt", ".md") if image.with_suffix(ext).is_file()]
         if not notes:
-            problems.append(f"人物素材 {image.relative_to(root)}：缺少同名 TXT/Markdown 说明")
+            problems.append(f"人物素材 {image.relative_to(root)}：资产设定中缺少对应人物/参考图片，且无既有同名 TXT/Markdown 说明")
             continue
         if not image.with_suffix(".txt").is_file() and image.with_suffix(".md").is_file():
             manual.append(
-                f"人物说明 {image.with_suffix('.md').relative_to(root)}：仅有 Markdown；请确认这是 owner 指定或既有兼容格式，新建人物说明默认使用 TXT"
+                f"人物说明 {image.with_suffix('.md').relative_to(root)}：仅有 Markdown，按既有格式兼容读取；新项目统一使用资产设定"
             )
         text = read_utf8(notes[0])
         checks = {
@@ -384,14 +593,17 @@ def check_people_notes(root: Path) -> tuple[list[str], list[str]]:
 
 
 def check_current_content(root: Path) -> dict:
-    source = root / "归档" / "文档源稿"
     problems: list[str] = []
     manual: list[str] = []
-    script_path = source / "剧本.md"
-    image_path, video_path = source / "分镜图提示词.md", source / "视频提示词与台词.md"
-    script_result = check_script(read_utf8(script_path)) if script_path.is_file() else {"问题": [], "待人工": []}
-    image_result = check_storyboard(read_utf8(image_path)) if image_path.is_file() else {"问题": [], "待人工": [], "镜头": []}
-    video_result = check_video(read_utf8(video_path)) if video_path.is_file() else {"问题": [], "待人工": [], "镜头": []}
+    script_path = _current_path(root, ("剧本",))
+    asset_path = _current_path(root, ("资产设定",))
+    image_path = _current_path(root, ("分镜", "分镜图提示词"))
+    video_path = _current_path(root, ("视频提示词", "视频提示词与台词"))
+    script_result = check_script(read_utf8(script_path)) if script_path else {"问题": [], "待人工": []}
+    image_result = check_storyboard(read_utf8(image_path), modern=image_path.stem == "分镜") if image_path else {"问题": [], "待人工": [], "镜头": []}
+    video_result = check_video(read_utf8(video_path), modern=True if video_path.stem == "视频提示词" else None) if video_path else {"问题": [], "待人工": [], "镜头": []}
+    asset_result = check_assets(read_utf8(asset_path)) if asset_path else {"问题": [], "待人工": []}
+    problems.extend(asset_result["问题"]); manual.extend(asset_result["待人工"])
     problems.extend(script_result["问题"]); problems.extend(image_result["问题"]); problems.extend(video_result["问题"])
     manual.extend(script_result["待人工"]); manual.extend(image_result["待人工"]); manual.extend(video_result["待人工"])
     if image_result["镜头"] and video_result["镜头"]:
@@ -405,7 +617,7 @@ def check_current_content(root: Path) -> dict:
             problems.append("分镜图与视频文档的镜号顺序不一致")
         for number in images.keys() & videos.keys():
             a, b = images[number], videos[number]
-            if (a.start, a.end) != (b.start, b.end):
+            if b.start is not None and (a.start, a.end) != (b.start, b.end):
                 problems.append(f"镜头{number}：分镜图与视频的全片时间不一致")
     p, m = check_people_notes(root)
     problems.extend(p); manual.extend(m)
@@ -414,10 +626,12 @@ def check_current_content(root: Path) -> dict:
 
 def check_source_content(path: Path, *, formal: bool) -> dict:
     text = read_utf8(path)
-    if path.name == "分镜图提示词.md":
-        result = check_storyboard(text)
-    elif path.name == "视频提示词与台词.md":
-        result = check_video(text)
+    if path.name in {"分镜.md", "分镜图提示词.md"}:
+        result = check_storyboard(text, modern=path.stem == "分镜")
+    elif path.name in {"视频提示词.md", "视频提示词与台词.md"}:
+        result = check_video(text, modern=True if path.stem == "视频提示词" else None)
+    elif path.name == "资产设定.md":
+        result = check_assets(text)
     elif path.name == "剧本.md":
         result = check_script(text)
     else:

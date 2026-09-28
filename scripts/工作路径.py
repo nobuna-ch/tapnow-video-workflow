@@ -6,8 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-CURRENT_KINDS = ("项目说明书", "剧本", "分镜图提示词", "视频提示词与台词", "素材与节点连接")
+DEFAULT_KINDS = ("剧本", "资产设定", "分镜", "视频提示词")
+LEGACY_ALIASES = {"分镜图提示词": "分镜", "视频提示词与台词": "视频提示词"}
+CURRENT_KINDS = (*DEFAULT_KINDS, *LEGACY_ALIASES, "项目说明书", "素材与节点连接")
 CURRENT_NAMES = {f"{name}.md" for name in CURRENT_KINDS}
+
+
+def canonical_kind(name: str) -> str:
+    """旧名称仍可读取/原名导出，但同类当前文档只能保留一份。"""
+    return LEGACY_ALIASES.get(name, name)
 
 
 def _resolved(path: Path) -> Path:
@@ -105,6 +112,15 @@ def plan_export(
         raise ValueError("--修复归档只适用于历史版本目录中的源稿")
     if not current and not draft:
         raise ValueError("未知或非当前文档名只能作为 --草稿 导出")
+    if current and not draft:
+        aliases = {name for name in CURRENT_KINDS if canonical_kind(name) == canonical_kind(markdown.stem)}
+        conflicts = [folder / f"{name}.md" for name in aliases
+                     for folder in (root, root / "归档" / "文档源稿")
+                     if (folder / f"{name}.md").is_file() and _resolved(folder / f"{name}.md") != markdown]
+        conflicts.extend(root / f"{name}.docx" for name in aliases
+                         if name != markdown.stem and (root / f"{name}.docx").is_file())
+        if conflicts:
+            raise ValueError("同类当前文档只能保留一份，新旧名称不能同时导出：" + "、".join(p.name for p in conflicts))
 
     if output is not None:
         target = _resolved(output)
