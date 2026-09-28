@@ -10,11 +10,14 @@
 - [编剧集成](references/编剧集成.md)：六个短片编剧模块的轻量适配，不需要安装另一套知识库。
 - [自动评审](references/自动评审.md)：主笔与三位评审、最多三份候选、局部变更、停止条件，以及流程守卫的实际用法。
 - [制作规则](references/制作规则.md)：资产与分镜独立看图、风格基准、防漂移、出图与 prompt-only 分支。
+- [视觉方向与评审](references/视觉方向与评审.md)：把整体气质落实为构图、用光与表演，用镜头任务和画面证据评审；关键镜头需要时才比较备选，不默认额外出图。
 - [执行与验收](references/执行与验收.md)：DOCX 导出、历史保护、检查和页面验证。
 
 宿主提供 Goal、子代理和图像生成工具；本包不实现后台运行器，不安装重型代理框架、GPU 审美模型、视频模型适配或 TapNow 服务。Goal 仅在 owner 明确要求且宿主支持时使用；它不能越过 owner gate 或重置额度。
 
 基础讨论可只读规则。可执行守卫和文本检查使用 Python 3.10+ 标准库；Word 导出使用 `python-docx` 与 `Pillow`。自动评审需要真实独立代理，视觉 pass 需要实际看图；缺少相应能力就注明未执行，不能用主笔自评冒充。
+
+视觉方法随包离线提供，无新增运行依赖：RampStack 的创意方向负责整体取舍，art-direct 的视觉表达与评审方法负责意图和画面的对照，电影单镜头设计仅在难镜头中按需试用。结果进入既有视觉基准、分镜和评审，不新增项目表单或第四位评审。方法集成不代表已经验证成片效果。
 
 ## 有界评审
 
@@ -112,5 +115,7 @@ python -B -X utf8 "$skillRoot\tests\流程守卫测试.py"
 ## 来源与许可
 
 沿用 [screenwriting-skills](https://github.com/jtydhr88/screenwriting-skills) 六模块的精简适配；固定来源与范围见 [SOURCE](third_party/screenwriting-skills/SOURCE.md)。本次新增的有限循环、状态守卫和交付规则属于本工作流设计，不声称上游已实现同一自动系统。
+
+视觉方法轻量适配自 [RampStack / claude-skills](https://github.com/rampstackco/claude-skills)、[art-direct](https://github.com/nraford7/art-direct) 与 [cinematic-shot-design-skill](https://github.com/ErosShen/cinematic-shot-design-skill)；固定提交、采用范围与原许可证见 [视觉来源记录](third_party/visual-direction/SOURCE.md)。未捆绑完整上游技能、生成服务、示例媒体或评分模型。
 
 原创文件采用 [MIT](LICENSE)。第三方许可见 [THIRD_PARTY](THIRD_PARTY.md)，上游原许可及 NOTICE 保留。用户项目照片、品牌资料、字体、音乐、平台服务及其生成内容不因本包许可证而自动获授权；私有素材和账户信息不进入技能包。
